@@ -3,7 +3,6 @@
 ## Immediate (do today)
 
 - [ ] Open `http://localhost:8501` — test all sidebar filters, check for visual bugs
-- [ ] Add group member names to `README.md`
 - [ ] Write 5 key findings in `README.md` — use real numbers from the scatter and tax drain charts
 
 ## Before Submission
