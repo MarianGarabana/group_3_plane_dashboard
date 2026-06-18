@@ -6,6 +6,7 @@ Run: streamlit run app.py
 Data must be pre-generated first: python db.py
 """
 
+import json
 from pathlib import Path
 
 import plotly.express as px
@@ -13,11 +14,13 @@ import plotly.graph_objects as go
 import polars as pl
 import streamlit as st
 
+from db import DataNotGeneratedError, read_extract
 from analysis import (
-    FUEL_PRICE_USD,
+    DEFAULT_FUEL_PRICE_USD,
     apply_filters,
     compute_kpis,
     enrich_revenue_with_airports,
+    filter_fuel_by_year,
     fleet_efficiency,
     margin_trend,
     route_profitability,
@@ -37,29 +40,60 @@ DATA_DIR = Path(__file__).parent / "data"
 
 # ── data loading (cached so Streamlit doesn't re-read on every interaction) ──
 
+def _load_parquet(name: str) -> pl.DataFrame:
+    """Read one Parquet extract, or stop the app with a clear message if the
+    data has not been generated yet."""
+    try:
+        return read_extract(name)
+    except DataNotGeneratedError as exc:
+        st.error(f"{exc} Then reload this page.")
+        st.stop()
+
+
 @st.cache_data
 def load_revenue() -> pl.DataFrame:
-    return pl.read_parquet(DATA_DIR / "revenue.parquet")
+    return _load_parquet("revenue.parquet")
 
 
 @st.cache_data
 def load_fuel() -> pl.DataFrame:
-    return pl.read_parquet(DATA_DIR / "fuel.parquet")
+    return _load_parquet("fuel.parquet")
 
 
 @st.cache_data
 def load_airports() -> pl.DataFrame:
-    return pl.read_parquet(DATA_DIR / "airports.parquet")
+    return _load_parquet("airports.parquet")
+
+
+@st.cache_data
+def load_enriched_revenue() -> pl.DataFrame:
+    """Revenue joined with airport continent/city. Cached because it depends
+    only on the (cached) Parquet files, never on the sidebar filters."""
+    return enrich_revenue_with_airports(load_revenue(), load_airports())
+
+
+@st.cache_data
+def compute_margin_trend(fuel_price: float) -> pl.DataFrame:
+    """Full-history margin trend. Cached per fuel price because it uses the
+    unfiltered revenue and so does not change when the sidebar filters move."""
+    return margin_trend(load_enriched_revenue(), load_fuel(), fuel_price)
+
+
+def data_generated_at() -> str | None:
+    """Read the generation timestamp written by db.py, if present."""
+    meta_path = DATA_DIR / "_generated.json"
+    if not meta_path.exists():
+        return None
+    try:
+        return json.loads(meta_path.read_text()).get("generated_at")
+    except (ValueError, OSError):
+        return None
 
 
 # ── load and enrich ──────────────────────────────────────────────────────────
 
-revenue_raw = load_revenue()
+revenue_enriched = load_enriched_revenue()
 fuel = load_fuel()
-airports = load_airports()
-
-# Join continent / city onto revenue rows once; filters operate on this df
-revenue_enriched = enrich_revenue_with_airports(revenue_raw, airports)
 
 # ── sidebar filters ──────────────────────────────────────────────────────────
 
@@ -97,9 +131,19 @@ min_tickets = st.sidebar.slider(
     help="Remove low-volume routes that can skew the profitability scatter.",
 )
 
+fuel_price = st.sidebar.slider(
+    "Fuel price ($/gallon)",
+    min_value=1.5,
+    max_value=5.0,
+    value=float(DEFAULT_FUEL_PRICE_USD),
+    step=0.25,
+    help="Jet-A spot price has ranged roughly $1.5–5/gallon. "
+    "All fuel cost and margin figures recalculate live.",
+)
+
 st.sidebar.markdown("---")
 st.sidebar.caption(
-    f"Fuel price assumption: **${FUEL_PRICE_USD}/gallon** (fixed).\n\n"
+    f"Fuel price: **${fuel_price:.2f}/gallon**.\n\n"
     "Taxes treated as pass-through — excluded from net revenue."
 )
 
@@ -113,6 +157,9 @@ revenue_filtered = apply_filters(
     origin_continents=origin_continents,
     min_tickets=min_tickets,
 )
+# Fuel carries the same year dimension as revenue; filter it to the same
+# window so no chart pairs filtered revenue against all-history fuel.
+fuel_filtered = filter_fuel_by_year(fuel, year_range[0], year_range[1])
 
 # ── header ───────────────────────────────────────────────────────────────────
 
@@ -120,12 +167,19 @@ st.title("✈ IE Airlines — The Real P&L")
 st.caption(
     "Everyone shows revenue. We show what's left after costs.  "
     "Net revenue = ticket price excluding taxes. "
-    "Fuel cost estimated at $3/gallon."
+    f"Fuel cost estimated at ${fuel_price:.2f}/gallon."
 )
+
+if revenue_filtered.is_empty():
+    st.warning(
+        "No data matches the current filters. Widen the year range, clear the "
+        "continent filter, or lower the minimum ticket volume."
+    )
+    st.stop()
 
 # ── KPI cards ────────────────────────────────────────────────────────────────
 
-kpis = compute_kpis(revenue_filtered, fuel)
+kpis = compute_kpis(revenue_filtered, fuel_filtered, fuel_price)
 
 c1, c2, c3, c4, c5, c6 = st.columns(6)
 c1.metric("Net Revenue", f"${kpis['total_net_revenue'] / 1e9:.2f}B")
@@ -146,7 +200,7 @@ st.caption(
     "below means fuel cost dominates."
 )
 
-scatter_df = route_profitability(revenue_filtered, fuel)
+scatter_df = route_profitability(revenue_filtered, fuel_filtered, fuel_price)
 
 if scatter_df.is_empty():
     st.warning("No data for selected filters.")
@@ -258,7 +312,7 @@ st.caption(
     "proportional revenue return."
 )
 
-fleet_df = fleet_efficiency(revenue_filtered, fuel)
+fleet_df = fleet_efficiency(revenue_filtered, fuel_filtered, fuel_price)
 
 if fleet_df.is_empty():
     st.warning("No fleet data available.")
@@ -286,16 +340,17 @@ else:
 
 st.markdown("---")
 
-# ── Section 4: Margin Trend 2000–2024 ────────────────────────────────────────
+# ── Section 4: Margin Trend ──────────────────────────────────────────────────
 
-st.subheader("4 · Margin Trend 2000–2024")
+trend_df = compute_margin_trend(fuel_price)  # full timeline, unaffected by filters
+trend_yr_min = int(trend_df["yr"].min())
+trend_yr_max = int(trend_df["yr"].max())
+
+st.subheader(f"4 · Margin Trend {trend_yr_min}–{trend_yr_max}")
 st.caption(
-    "Annual net revenue vs estimated fuel cost. "
-    "Fuel cost is allocated proportionally across years "
-    "(see README for methodology)."
+    "Annual net revenue vs estimated fuel cost, with fuel summed per year. "
+    "Shown across the full data history regardless of the sidebar filters."
 )
-
-trend_df = margin_trend(revenue_enriched, fuel)  # use unfiltered revenue for full timeline
 
 fig4 = go.Figure()
 fig4.add_trace(go.Scatter(
@@ -356,3 +411,11 @@ with st.expander("Data preview — filtered revenue table"):
         file_name="ie_airlines_revenue_filtered.csv",
         mime="text/csv",
     )
+
+# ── footer: data freshness ────────────────────────────────────────────────────
+
+_generated = data_generated_at()
+if _generated:
+    st.caption(f"Data generated on {_generated} (committed Parquet extracts).")
+else:
+    st.caption("Data generation date unknown — run `python db.py` to refresh.")
