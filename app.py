@@ -9,6 +9,7 @@ Navigation: session-state driven single-file multi-page app.
   st.session_state["page"] = "home" | "q1" | "q2" | "q3" | "q4"
 """
 
+import json
 from pathlib import Path
 
 import plotly.express as px
@@ -16,11 +17,13 @@ import plotly.graph_objects as go
 import polars as pl
 import streamlit as st
 
+from db import DataNotGeneratedError, read_extract
 from analysis import (
-    FUEL_PRICE_USD,
+    DEFAULT_FUEL_PRICE_USD,
     apply_filters,
     compute_kpis,
     enrich_revenue_with_airports,
+    filter_fuel_by_year,
     fleet_efficiency,
     margin_trend,
     route_profitability,
@@ -80,22 +83,56 @@ QUESTIONS = {
 
 # ── data loading (cached) ─────────────────────────────────────────────────────
 
+def _load_parquet(name: str) -> pl.DataFrame:
+    """Read one Parquet extract, or stop the app with a clear message if the
+    data has not been generated yet."""
+    try:
+        return read_extract(name)
+    except DataNotGeneratedError as exc:
+        st.error(f"{exc} Then reload this page.")
+        st.stop()
+
+
 @st.cache_data
 def load_revenue() -> pl.DataFrame:
-    return pl.read_parquet(DATA_DIR / "revenue.parquet")
+    return _load_parquet("revenue.parquet")
 
 @st.cache_data
 def load_fuel() -> pl.DataFrame:
-    return pl.read_parquet(DATA_DIR / "fuel.parquet")
+    return _load_parquet("fuel.parquet")
 
 @st.cache_data
 def load_airports() -> pl.DataFrame:
-    return pl.read_parquet(DATA_DIR / "airports.parquet")
+    return _load_parquet("airports.parquet")
 
-revenue_raw = load_revenue()
-fuel        = load_fuel()
-airports    = load_airports()
-revenue_enriched = enrich_revenue_with_airports(revenue_raw, airports)
+
+@st.cache_data
+def load_enriched_revenue() -> pl.DataFrame:
+    """Revenue joined with airport continent/city. Cached because it depends
+    only on the (cached) Parquet files, never on the sidebar filters."""
+    return enrich_revenue_with_airports(load_revenue(), load_airports())
+
+
+@st.cache_data
+def compute_margin_trend(fuel_price: float) -> pl.DataFrame:
+    """Full-history margin trend. Cached per fuel price because it uses the
+    unfiltered revenue and so does not change when the sidebar filters move."""
+    return margin_trend(load_enriched_revenue(), load_fuel(), fuel_price)
+
+
+def data_generated_at() -> str | None:
+    """Read the generation timestamp written by db.py, if present."""
+    meta_path = DATA_DIR / "_generated.json"
+    if not meta_path.exists():
+        return None
+    try:
+        return json.loads(meta_path.read_text()).get("generated_at")
+    except (ValueError, OSError):
+        return None
+
+
+revenue_enriched = load_enriched_revenue()
+fuel = load_fuel()
 
 # ── routing helpers ───────────────────────────────────────────────────────────
 
@@ -110,7 +147,12 @@ current_page = st.session_state["page"]
 # ── shared sidebar (only shown on analysis pages) ─────────────────────────────
 
 def render_sidebar() -> tuple:
-    """Render sidebar filters and return (revenue_filtered, kpis)."""
+    """Render sidebar filters and return (revenue_filtered, fuel_filtered, fuel_price).
+
+    Fuel carries the same year dimension as revenue, so it is filtered to the
+    same year window here — no chart should pair filtered revenue against
+    all-history fuel.
+    """
     icon_col, btn_col = st.sidebar.columns([1, 3])
     icon_col.markdown(
         '<p style="font-size:2.2rem; text-align:center; margin:0">🏠</p>',
@@ -147,13 +189,19 @@ def render_sidebar() -> tuple:
         help="Remove low-volume routes that can skew the profitability scatter.",
     )
 
+    fuel_price = st.sidebar.slider(
+        "Fuel price ($/gallon)", 1.5, 5.0, float(DEFAULT_FUEL_PRICE_USD), step=0.25,
+        help="Jet-A spot price has ranged roughly $1.5–5/gallon. "
+        "All fuel cost and margin figures recalculate live.",
+    )
+
     st.sidebar.markdown("---")
     st.sidebar.caption(
-        f"Fuel price assumption: **${FUEL_PRICE_USD}/gallon** (fixed).\n\n"
+        f"Fuel price: **${fuel_price:.2f}/gallon**.\n\n"
         "Taxes treated as pass-through — excluded from net revenue."
     )
 
-    return apply_filters(
+    revenue_filtered = apply_filters(
         revenue_enriched,
         year_min=year_range[0],
         year_max=year_range[1],
@@ -161,6 +209,8 @@ def render_sidebar() -> tuple:
         origin_continents=origin_continents,
         min_tickets=min_tickets,
     )
+    fuel_filtered = filter_fuel_by_year(fuel, year_range[0], year_range[1])
+    return revenue_filtered, fuel_filtered, fuel_price
 
 
 def render_kpi_strip(kpis: dict) -> None:
@@ -185,7 +235,8 @@ def render_home() -> None:
     )
     st.markdown("---")
 
-    kpis = compute_kpis(revenue_enriched, fuel)
+    # Overview at the default fuel price; each analysis page has a live slider.
+    kpis = compute_kpis(revenue_enriched, fuel, DEFAULT_FUEL_PRICE_USD)
     render_kpi_strip(kpis)
     st.markdown("---")
 
@@ -212,16 +263,19 @@ def render_home() -> None:
 
     st.markdown("---")
     st.caption(
-        f"Data: IE Airlines internal extract · Fuel assumption: ${FUEL_PRICE_USD}/gallon · "
+        f"Data: IE Airlines internal extract · Fuel assumption: ${DEFAULT_FUEL_PRICE_USD}/gallon · "
         "Taxes treated as pass-through."
     )
+    generated = data_generated_at()
+    if generated:
+        st.caption(f"Data generated on {generated} (committed Parquet extracts).")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Q1 — ROUTE PROFITABILITY
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def render_q1(revenue_filtered: pl.DataFrame) -> None:
+def render_q1(revenue_filtered: pl.DataFrame, fuel_filtered: pl.DataFrame, fuel_price: float) -> None:
     st.title(f"{QUESTIONS['q1']['emoji']} {QUESTIONS['q1']['title']}")
     st.subheader(QUESTIONS["q1"]["question"])
     st.markdown("---")
@@ -237,7 +291,7 @@ def render_q1(revenue_filtered: pl.DataFrame) -> None:
         """
     )
 
-    scatter_df = route_profitability(revenue_filtered, fuel)
+    scatter_df = route_profitability(revenue_filtered, fuel_filtered, fuel_price)
 
     if scatter_df.is_empty():
         st.warning("No data for selected filters.")
@@ -309,6 +363,10 @@ def render_q2(revenue_filtered: pl.DataFrame) -> None:
 
     tax_df = tax_drain_by_route(revenue_filtered)
 
+    if tax_df.is_empty():
+        st.warning("No data for selected filters.")
+        return
+
     col_a, col_b = st.columns(2)
 
     with col_a:
@@ -353,7 +411,7 @@ def render_q2(revenue_filtered: pl.DataFrame) -> None:
 # Q3 — FLEET EFFICIENCY
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def render_q3(revenue_filtered: pl.DataFrame) -> None:
+def render_q3(revenue_filtered: pl.DataFrame, fuel_filtered: pl.DataFrame, fuel_price: float) -> None:
     st.title(f"{QUESTIONS['q3']['emoji']} {QUESTIONS['q3']['title']}")
     st.subheader(QUESTIONS["q3"]["question"])
     st.markdown("---")
@@ -369,7 +427,7 @@ def render_q3(revenue_filtered: pl.DataFrame) -> None:
         """
     )
 
-    fleet_df = fleet_efficiency(revenue_filtered, fuel)
+    fleet_df = fleet_efficiency(revenue_filtered, fuel_filtered, fuel_price)
 
     if fleet_df.is_empty():
         st.warning("No fleet data available.")
@@ -406,26 +464,28 @@ def render_q3(revenue_filtered: pl.DataFrame) -> None:
 # Q4 — MARGIN TREND
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def render_q4() -> None:
+def render_q4(fuel_price: float) -> None:
     st.title(f"{QUESTIONS['q4']['emoji']} {QUESTIONS['q4']['title']}")
     st.subheader(QUESTIONS["q4"]["question"])
     st.markdown("---")
 
+    trend_df = compute_margin_trend(fuel_price)  # always full history
+    yr_lo, yr_hi = int(trend_df["yr"].min()), int(trend_df["yr"].max())
+
     st.markdown(
-        """
+        f"""
         **Why this matters:** A single margin snapshot is misleading — what matters is
         the trajectory. Is the gap between revenue and fuel cost widening or narrowing?
 
-        **Methodology note:** Fuel data has no year dimension, so fleet-wide fuel cost is
-        allocated proportionally by each year's share of total net revenue. This means the
-        trend reflects revenue mix changes, not actual year-by-year fuel price variation.
+        **Methodology note:** Fuel is grouped by year at the source (`YEAR(DEPARTURE)`),
+        so each year's fuel cost is the real per-year burn — not a revenue-proportional
+        estimate. The margin can therefore genuinely vary year to year. Shown across the
+        full history ({yr_lo}–{yr_hi}) regardless of the sidebar filters.
 
         **How to read these charts:** Top = absolute net revenue vs estimated fuel cost by year.
         Bottom = resulting margin %, with a red break-even line at 0%.
         """
     )
-
-    trend_df = margin_trend(revenue_enriched, fuel)  # always full history
 
     fig_abs = go.Figure()
     fig_abs.add_trace(go.Scatter(
@@ -471,15 +531,15 @@ def render_q4() -> None:
 if current_page == "home":
     render_home()
 else:
-    revenue_filtered = render_sidebar()
+    revenue_filtered, fuel_filtered, fuel_price = render_sidebar()
 
     if current_page == "q1":
-        render_q1(revenue_filtered)
+        render_q1(revenue_filtered, fuel_filtered, fuel_price)
     elif current_page == "q2":
         render_q2(revenue_filtered)
     elif current_page == "q3":
-        render_q3(revenue_filtered)
+        render_q3(revenue_filtered, fuel_filtered, fuel_price)
     elif current_page == "q4":
-        render_q4()
+        render_q4(fuel_price)
     else:
         go_to("home")

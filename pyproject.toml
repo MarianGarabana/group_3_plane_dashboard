@@ -21,6 +21,7 @@ dev = [
     "jupyter>=1.0.0",
     "ipykernel>=6.0.0",
     "notebook>=7.0.0",
+    "pytest>=8.0.0",
 ]
 
 [tool.uv]
@@ -28,4 +29,11 @@ dev-dependencies = [
     "jupyter>=1.0.0",
     "ipykernel>=6.0.0",
     "notebook>=7.0.0",
+    "pytest>=8.0.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "db: integration tests that need a live DB2 connection (skipped without one)",
 ]

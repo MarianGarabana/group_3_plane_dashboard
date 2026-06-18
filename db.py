@@ -4,10 +4,17 @@ db.py — DB2 connection, helper functions, and data extraction.
 Workflow: run this file directly (python db.py) to pull all three
 pre-aggregated datasets from the DB and save them as Parquet files
 under data/. The Streamlit app then reads those files — no live DB
-connection at dashboauv syncrd runtime.
+connection at dashboard runtime.
+
+Credentials are read from environment variables (a local .env file works
+via python-dotenv). See the README for the required keys. There are no
+hardcoded credential defaults: the password is a secret and must never
+live in source.
 """
 
+import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote_plus
 
@@ -18,23 +25,43 @@ from sqlalchemy import create_engine, text
 load_dotenv()
 
 # ── connection parameters ────────────────────────────────────────────────────
+#
+# Host / port / database name carry non-secret defaults for convenience.
+# Username and password have NO defaults — they are secrets and are required
+# at connect time (validated in make_engine, not at import, so the pure
+# helpers below can be imported and unit-tested without any credentials).
 
 DB_HOST = os.getenv("DB_HOST", "52.211.123.34")
 DB_PORT = int(os.getenv("DB_PORT", "25010"))
 DB_NAME = os.getenv("DB_NAME", "ATTPLANE")
-DB_USERNAME = os.getenv("DB_USERNAME", "attgrp3")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "bigdata")
-SCHEMA = "ATTGRP3"
+DB_USERNAME = os.getenv("DB_USERNAME")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
+SCHEMA = os.getenv("DB_SCHEMA", "ATTGRP3")
 
 DATA_DIR = Path(__file__).parent / "data"
+
+# Env var names required to open a connection — used for fail-fast messaging.
+_REQUIRED_ENV = ("DB_USERNAME", "DB_PASSWORD")
 
 
 # ── engine factory ───────────────────────────────────────────────────────────
 
 def make_engine():
-    """Return a SQLAlchemy engine for DB2 via ibm_db_sa dialect."""
-    user = quote_plus(DB_USERNAME)
-    password = quote_plus(DB_PASSWORD)
+    """Return a SQLAlchemy engine for DB2 via ibm_db_sa dialect.
+
+    Fails fast with a clear message if the required credential env vars are
+    missing, rather than producing a cryptic driver error at query time.
+    """
+    missing = [name for name in _REQUIRED_ENV if not os.getenv(name)]
+    if missing:
+        raise RuntimeError(
+            "Missing required environment variable(s): "
+            + ", ".join(missing)
+            + ". Set them in a .env file (see README → How to Install)."
+        )
+
+    user = quote_plus(os.environ["DB_USERNAME"])
+    password = quote_plus(os.environ["DB_PASSWORD"])
     url = f"db2+ibm_db://{user}:{password}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
     # pool_pre_ping checks the connection is alive before handing it out
     return create_engine(url, pool_pre_ping=True)
@@ -70,29 +97,6 @@ def normalize_column_names(df: pl.DataFrame) -> pl.DataFrame:
     return df.rename({col: col.strip().lower() for col in df.columns})
 
 
-# ── exploration helpers ──────────────────────────────────────────────────────
-
-def preview_table(schema: str, table: str, limit: int = 10, engine=None) -> pl.DataFrame:
-    """Return the first `limit` rows of a table as a Polars DataFrame.
-    Useful during exploration — never used by the dashboard itself."""
-    if engine is None:
-        engine = make_engine()
-    query = (
-        f"SELECT * FROM {qualified_table(schema, table)} "
-        f"FETCH FIRST {int(limit)} ROWS ONLY"
-    )
-    return _read_sql(query, engine)
-
-
-def count_rows(schema: str, table: str, engine=None) -> int:
-    """Return the exact row count of a table as a Python int.
-    Uses .item() so the caller gets a scalar, not a DataFrame."""
-    if engine is None:
-        engine = make_engine()
-    query = f"SELECT COUNT(*) AS n_rows FROM {qualified_table(schema, table)}"
-    return _read_sql(query, engine).item(0, "n_rows")
-
-
 def test_connection(engine) -> bool:
     """Ping the DB with a lightweight query. DB2 uses SYSIBM.SYSDUMMY1
     as its equivalent of PostgreSQL's SELECT 1."""
@@ -112,8 +116,8 @@ def extract_revenue(engine) -> pl.DataFrame:
     """Query 1: revenue + taxes grouped by route / year / cabin class.
 
     Grouping by YEAR(DEPARTURE) and CLASS means Python receives one row
-    per (route, year, class) combination — roughly 59 routes × 25 years
-    × 3 classes ≈ 4 000 rows maximum.
+    per (route, year, class) combination — roughly 59 routes × 16 years
+    × 3 classes ≈ 3 000 rows.
     """
     query = f"""
         SELECT
@@ -147,10 +151,14 @@ def extract_revenue(engine) -> pl.DataFrame:
 
 
 def extract_fuel(engine) -> pl.DataFrame:
-    """Query 2: fuel consumption grouped by route + aircraft model.
+    """Query 2: fuel consumption grouped by route + aircraft model + year.
 
     total_fuel_gallons = flights operated × fuel burn rate × flight hours.
-    Multiplying by $3/gallon in analysis.py gives estimated fuel cost.
+    Multiplying by the fuel price in analysis.py gives estimated fuel cost.
+
+    YEAR(f.DEPARTURE) is grouped in so fuel carries the same year dimension
+    as revenue. Without it, any year-filtered view would pair filtered
+    revenue against all-history fuel — see analysis.py for why that matters.
     The grouping keeps the fuel burn attributes (FUEL_GALLONS_HOUR,
     FLIGHT_MINUTES) in the result so analysis.py can recalculate at any
     fuel price without re-querying the DB.
@@ -161,6 +169,7 @@ def extract_fuel(engine) -> pl.DataFrame:
         SELECT
             f.ROUTE_CODE,
             a.MODEL,
+            YEAR(f.DEPARTURE)  AS yr,
             r.FLIGHT_MINUTES,
             a.FUEL_GALLONS_HOUR,
             COUNT(*) AS flights_operated
@@ -172,6 +181,7 @@ def extract_fuel(engine) -> pl.DataFrame:
         GROUP BY
             f.ROUTE_CODE,
             a.MODEL,
+            YEAR(f.DEPARTURE),
             r.FLIGHT_MINUTES,
             a.FUEL_GALLONS_HOUR
     """
@@ -194,6 +204,46 @@ def extract_airports(engine) -> pl.DataFrame:
     """
     query = f"SELECT * FROM {qualified_table(SCHEMA, 'AIRPORTS')}"
     return _read_sql(query, engine)
+
+
+# ── reading generated extracts (no DB needed) ─────────────────────────────────
+
+class DataNotGeneratedError(FileNotFoundError):
+    """Raised when a Parquet extract is requested before db.py produced it."""
+
+
+def read_extract(name: str) -> pl.DataFrame:
+    """Read one generated Parquet extract from DATA_DIR.
+
+    Raises DataNotGeneratedError (a FileNotFoundError) if the file is missing,
+    so the UI layer can show a friendly 'run python db.py first' message
+    instead of an opaque traceback.
+    """
+    path = DATA_DIR / name
+    if not path.exists():
+        raise DataNotGeneratedError(
+            f"Parquet extract '{name}' not found in {DATA_DIR}. "
+            "Run `python db.py` to generate the data files."
+        )
+    return pl.read_parquet(path)
+
+
+# ── generation metadata ──────────────────────────────────────────────────────
+
+def write_generation_metadata(row_counts: dict[str, int]) -> None:
+    """Record when the Parquet files were generated and how big they are.
+
+    The dashboard reads this to show a "data generated on" date, so a viewer
+    can tell how fresh the committed Parquet is. Since the data files are
+    committed to the repo (so Streamlit Cloud can read them without a DB),
+    this is the only signal that they might be stale.
+    """
+    meta = {
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "schema": SCHEMA,
+        "row_counts": row_counts,
+    }
+    (DATA_DIR / "_generated.json").write_text(json.dumps(meta, indent=2))
 
 
 # ── main: pull data and save to Parquet ──────────────────────────────────────
@@ -222,6 +272,15 @@ def main():
     airports = extract_airports(engine)
     airports.write_parquet(DATA_DIR / "airports.parquet")
     print(f"  airports.parquet — {airports.height:,} rows")
+
+    write_generation_metadata(
+        {
+            "revenue": revenue.height,
+            "fuel": fuel.height,
+            "airports": airports.height,
+        }
+    )
+    print("  _generated.json — freshness metadata written")
 
     print("\nAll Parquet files saved to data/. Run: streamlit run app.py")
 

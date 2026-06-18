@@ -1,0 +1,26 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        # The DB2 driver (ibm-db) is intentionally omitted: it is only needed
+        # to connect to the database, not to import db.py or run the unit
+        # tests. The DB-marked integration tests skip without credentials.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install polars pandas pyarrow plotly python-dotenv streamlit sqlalchemy pytest
+
+      - name: Run tests
+        run: python -m pytest -q
