@@ -101,7 +101,6 @@ revenue_enriched = enrich_revenue_with_airports(revenue_raw, airports)
 
 def go_to(page: str) -> None:
     st.session_state["page"] = page
-    st.rerun()
 
 if "page" not in st.session_state:
     st.session_state["page"] = "home"
@@ -112,6 +111,19 @@ current_page = st.session_state["page"]
 
 def render_sidebar() -> tuple:
     """Render sidebar filters and return (revenue_filtered, kpis)."""
+    icon_col, btn_col = st.sidebar.columns([1, 3])
+    icon_col.markdown(
+        '<p style="font-size:2.2rem; text-align:center; margin:0">🏠</p>',
+        unsafe_allow_html=True,
+    )
+    btn_col.button(
+        "← Home",
+        on_click=go_to,
+        args=("home",),
+        use_container_width=True,
+        type="primary",
+    )
+    st.sidebar.markdown("---")
     st.sidebar.title("Filters")
 
     yr_min = int(revenue_enriched["yr"].min())
@@ -141,10 +153,7 @@ def render_sidebar() -> tuple:
         "Taxes treated as pass-through — excluded from net revenue."
     )
 
-    if st.sidebar.button("← Back to home"):
-        go_to("home")
-
-    rev_filtered = apply_filters(
+    return apply_filters(
         revenue_enriched,
         year_min=year_range[0],
         year_max=year_range[1],
@@ -152,8 +161,6 @@ def render_sidebar() -> tuple:
         origin_continents=origin_continents,
         min_tickets=min_tickets,
     )
-    kpis = compute_kpis(rev_filtered, fuel)
-    return rev_filtered, kpis
 
 
 def render_kpi_strip(kpis: dict) -> None:
@@ -176,6 +183,10 @@ def render_home() -> None:
         "### Everyone shows revenue. We show what's left after costs.\n"
         "Select a question below to explore the analysis."
     )
+    st.markdown("---")
+
+    kpis = compute_kpis(revenue_enriched, fuel)
+    render_kpi_strip(kpis)
     st.markdown("---")
 
     # 2 × 2 grid of question cards
@@ -210,10 +221,9 @@ def render_home() -> None:
 # Q1 — ROUTE PROFITABILITY
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def render_q1(revenue_filtered: pl.DataFrame, kpis: dict) -> None:
+def render_q1(revenue_filtered: pl.DataFrame) -> None:
     st.title(f"{QUESTIONS['q1']['emoji']} {QUESTIONS['q1']['title']}")
     st.subheader(QUESTIONS["q1"]["question"])
-    render_kpi_strip(kpis)
     st.markdown("---")
 
     st.markdown(
@@ -282,10 +292,9 @@ def render_q1(revenue_filtered: pl.DataFrame, kpis: dict) -> None:
 # Q2 — TAX DRAIN
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def render_q2(revenue_filtered: pl.DataFrame, kpis: dict) -> None:
+def render_q2(revenue_filtered: pl.DataFrame) -> None:
     st.title(f"{QUESTIONS['q2']['emoji']} {QUESTIONS['q2']['title']}")
     st.subheader(QUESTIONS["q2"]["question"])
-    render_kpi_strip(kpis)
     st.markdown("---")
 
     st.markdown(
@@ -344,10 +353,9 @@ def render_q2(revenue_filtered: pl.DataFrame, kpis: dict) -> None:
 # Q3 — FLEET EFFICIENCY
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def render_q3(revenue_filtered: pl.DataFrame, kpis: dict) -> None:
+def render_q3(revenue_filtered: pl.DataFrame) -> None:
     st.title(f"{QUESTIONS['q3']['emoji']} {QUESTIONS['q3']['title']}")
     st.subheader(QUESTIONS["q3"]["question"])
-    render_kpi_strip(kpis)
     st.markdown("---")
 
     st.markdown(
@@ -398,10 +406,9 @@ def render_q3(revenue_filtered: pl.DataFrame, kpis: dict) -> None:
 # Q4 — MARGIN TREND
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def render_q4(kpis: dict) -> None:
+def render_q4() -> None:
     st.title(f"{QUESTIONS['q4']['emoji']} {QUESTIONS['q4']['title']}")
     st.subheader(QUESTIONS["q4"]["question"])
-    render_kpi_strip(kpis)
     st.markdown("---")
 
     st.markdown(
@@ -464,15 +471,15 @@ def render_q4(kpis: dict) -> None:
 if current_page == "home":
     render_home()
 else:
-    revenue_filtered, kpis = render_sidebar()
+    revenue_filtered = render_sidebar()
 
     if current_page == "q1":
-        render_q1(revenue_filtered, kpis)
+        render_q1(revenue_filtered)
     elif current_page == "q2":
-        render_q2(revenue_filtered, kpis)
+        render_q2(revenue_filtered)
     elif current_page == "q3":
-        render_q3(revenue_filtered, kpis)
+        render_q3(revenue_filtered)
     elif current_page == "q4":
-        render_q4(kpis)
+        render_q4()
     else:
         go_to("home")

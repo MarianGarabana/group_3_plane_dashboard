@@ -143,14 +143,19 @@ def compute_kpis(revenue_filtered: pl.DataFrame, fuel: pl.DataFrame) -> dict:
     best = route_pnl.sort("est_profit", descending=True).row(0, named=True)
     worst = route_pnl.sort("est_profit", descending=False).row(0, named=True)
 
+    def route_label(row: dict) -> str:
+        orig = row.get("origin") or "?"
+        dest = row.get("destination") or "?"
+        return f"{orig} → {dest}"
+
     return {
         "total_net_revenue": total_net_revenue,
         "total_fuel_cost": total_fuel_cost,
         "margin_pct": margin_pct,
         "tax_burden_pct": tax_burden_pct,
         "total_tickets": total_tickets,
-        "best_route": f"{best['origin']} → {best['destination']}",
-        "worst_route": f"{worst['origin']} → {worst['destination']}",
+        "best_route": route_label(best),
+        "worst_route": route_label(worst),
     }
 
 
